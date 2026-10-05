@@ -1,49 +1,47 @@
 // bb-plugin-council — frontend entry.
 //
-// One nav panel ("Council"): the list of councils, a transcript with stance
-// badges, a convene composer with a turn budget, and a seat roster showing
-// each seat's provider, stance, and chief marker.
-import { useCallback, useEffect, useState } from "react";
-import {
-  definePluginApp,
-  Markdown,
-  useRealtime,
-  useRpc,
-} from "@get-bb/plugin-sdk/app";
+// One nav panel ("Council"): a two-column page with the council list on the
+// left and the debate room on the right. The room shows the seat roster as
+// chips with live status, the transcript with stance badges, a job banner for
+// the running debate, and a composer with a turn budget. Create and settings
+// are inline forms. Styling is host Tailwind tokens only, matching the bb app.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, KeyboardEvent, ReactNode } from "react";
+import { definePluginApp, Markdown, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
   CouncilDetail,
   CouncilSummary,
   ContextOptions,
+  Job,
+  Seat,
+  SeatInput,
+  Stance,
   rpcContract,
 } from "./server";
+import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/ui/icon";
+import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 
 type Contract = typeof rpcContract;
 
 const PANEL_ID = "councils";
 const PANEL_PATH = "councils";
 const COUNCIL_CHANGED = "council-changed";
+const MAX_TURNS = 40;
 
-function stanceBadgeColor(stance: string): string {
-  if (stance === "agree") return "#16a34a";
-  if (stance === "disagree") return "#dc2626";
-  if (stance === "need-info") return "#d97706";
-  return "#6b7280";
-}
+// ---------------------------------------------------------------------------
+// Data hooks
+// ---------------------------------------------------------------------------
 
 function describeError(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-function stanceBadge(stance: string | null): string | null {
-  if (stance === null) return null;
-  const colors: Record<string, string> = {
-    agree: "#16a34a",
-    disagree: "#dc2626",
-    "need-info": "#d97706",
-    pass: "#6b7280",
-  };
-  const color = colors[stance] ?? "#6b7280";
-  return `<span style="color:${color};font-weight:600">[${stance}]</span>`;
+function councilIdOf(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const id = (payload as { councilId?: unknown }).councilId;
+  return typeof id === "string" ? id : null;
 }
 
 function useCouncils() {
@@ -61,7 +59,7 @@ function useCouncils() {
   }, [rpc]);
   useEffect(refetch, [refetch]);
   useRealtime(COUNCIL_CHANGED, refetch);
-  return { councils, error, refetch };
+  return { councils, error };
 }
 
 function useCouncil(councilId: string | null) {
@@ -78,297 +76,738 @@ function useCouncil(councilId: string | null) {
       (cause: unknown) => setError(describeError(cause)),
     );
   }, [rpc, councilId]);
-  useEffect(refetch, [refetch]);
-  useRealtime(COUNCIL_CHANGED, refetch);
-  return { detail, error, refetch };
+  useEffect(() => {
+    setDetail(null);
+    setError(null);
+    refetch();
+  }, [refetch]);
+  useRealtime(COUNCIL_CHANGED, (payload) => {
+    const changed = councilIdOf(payload);
+    if (changed === null || changed === councilId) refetch();
+  });
+  // Seat status flips inside seat threads are not all published; poll slowly
+  // while anything is running so the busy dots stay honest.
+  const busy =
+    detail?.seats.some((s) => s.status === "working") ||
+    (detail?.job !== null && detail?.job !== undefined);
+  useEffect(() => {
+    if (!busy) return;
+    const timer = setInterval(refetch, 4000);
+    return () => clearInterval(timer);
+  }, [busy, refetch]);
+  return { rpc, detail, error, refetch };
 }
 
-const composerStyles: React.CSSProperties = {
-  display: "flex",
-  gap: 8,
-  alignItems: "flex-start",
-  marginTop: 8,
-};
+// ---------------------------------------------------------------------------
+// Small presentational pieces
+// ---------------------------------------------------------------------------
 
-const textareaStyles: React.CSSProperties = {
-  flex: 1,
-  minHeight: 64,
-  resize: "vertical",
-  fontFamily: "inherit",
-  fontSize: 13,
-};
-
-const badgeStyles: React.CSSProperties = {
-  display: "inline-block",
-  padding: "1px 8px",
-  borderRadius: 999,
-  fontSize: 11,
-  border: "1px solid var(--bb-border, #8884)",
-  margin: "2px 4px 2px 0",
-};
-
-function statusColor(status: string): string {
-  if (status === "convened") return "#2563eb";
-  if (status === "paused") return "#d97706";
-  if (status === "verdict") return "#16a34a";
-  return "#6b7280";
-}
-
-function CouncilList(props: {
-  councils: CouncilSummary[];
-  onOpen: (id: string) => void;
-  onCreate: () => void;
-}) {
+function EmptyState({ children }: { children: ReactNode }) {
   return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <h3 style={{ margin: "4px 0" }}>Councils</h3>
-        <button onClick={props.onCreate}>New council…</button>
-      </div>
-      {props.councils.map((council) => (
-        <div
-          key={council.id}
-          onClick={() => props.onOpen(council.id)}
-          style={{ padding: "8px 6px", borderRadius: 8, cursor: "pointer", borderBottom: "1px solid var(--bb-border, #8882)" }}
-        >
-          <div style={{ fontWeight: 600 }}>
-            {council.title}{" "}
-            <span style={{ color: statusColor(council.status), fontSize: 12 }}>[{council.status}]</span>
-          </div>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>
-            {council.handles.map((h) => `@${h}`).join(", ")} · {council.messageCount} msgs
-            {council.lastAuthor !== null ? ` · last: ${council.lastAuthor}` : ""}
-          </div>
-        </div>
-      ))}
-      {props.councils.length === 0 && <p style={{ opacity: 0.7 }}>No councils yet. Create one, then convene it with a question.</p>}
+    <div
+      role="status"
+      className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-sm text-muted-foreground"
+    >
+      {children}
     </div>
   );
 }
 
-function CreateCouncilForm(props: { onDone: () => void }) {
+function isWorking(seat: Seat): boolean {
+  return seat.status === "working";
+}
+
+function StatusDot({ seat }: { seat: Seat }) {
+  if (isWorking(seat)) return <Icon name="Loading" className="size-3 shrink-0 animate-spin text-primary" aria-label="Working" />;
+  return (
+    <span
+      aria-hidden
+      className={cn("inline-block size-1.5 shrink-0 rounded-full", seat.lastStance === null ? "bg-muted-foreground/40" : "bg-muted-foreground/70")}
+    />
+  );
+}
+
+const STANCE_STYLE: Record<Stance, string> = {
+  agree: "border-foreground/30 text-foreground",
+  disagree: "border-destructive/50 text-destructive",
+  "need-info": "border-foreground/40 bg-foreground/10 text-foreground",
+  pass: "border-border text-muted-foreground",
+};
+const STANCE_ICON: Record<Stance, "Check" | "CircleX" | "CircleQuestion" | "ArrowRight"> = {
+  agree: "Check",
+  disagree: "CircleX",
+  "need-info": "CircleQuestion",
+  pass: "ArrowRight",
+};
+
+function StanceBadge({ stance, small }: { stance: Stance; small?: boolean }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded-full border font-medium",
+        small ? "px-1.5 py-0 text-[10px]" : "px-2 py-0.5 text-[11px]",
+        STANCE_STYLE[stance],
+      )}
+      title={`Stance: ${stance}`}
+    >
+      <Icon name={STANCE_ICON[stance]} className={small ? "size-2.5" : "size-3"} />
+      {stance}
+    </span>
+  );
+}
+
+const STATUS_STYLE: Record<string, string> = {
+  idle: "text-muted-foreground",
+  convened: "text-primary",
+  paused: "text-destructive",
+  verdict: "text-foreground",
+};
+
+function timeLabel(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/** Re-renders once a second while `enabled`, for elapsed timers. */
+function useTicker(enabled: boolean): number {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!enabled) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [enabled]);
+  return now;
+}
+
+function WorkingRow({ seat, now }: { seat: Seat; now: number }) {
+  void now;
+  return (
+    <li className="flex flex-col gap-1 py-3" aria-live="polite">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <Icon name="Loading" className="size-3.5 animate-spin text-primary" />
+        <span className="font-medium text-foreground">@{seat.handle}</span>
+        <span className="text-muted-foreground">{seat.providerId}</span>
+        <span className="text-muted-foreground">is thinking…</span>
+      </div>
+    </li>
+  );
+}
+
+function MessageRow({ message, providerOf }: { message: CouncilDetail["messages"][number]; providerOf: (handle: string) => string | null }) {
+  const isUser = message.author === "user";
+  if (message.author === "system") {
+    return <li className="py-1.5 text-center text-xs text-muted-foreground">{message.text}</li>;
+  }
+  const provider = providerOf(message.author);
+  return (
+    <li className={cn("flex flex-col gap-1 py-3", isUser && "items-end")} id={`msg-${message.seq}`}>
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span className="font-medium text-foreground">{isUser ? "you" : `@${message.author}`}</span>
+        {provider ? <span className="text-muted-foreground">{provider}</span> : null}
+        {message.stance ? <StanceBadge stance={message.stance} /> : null}
+        <span className="text-muted-foreground">
+          #{message.seq} · {timeLabel(message.createdAt)}
+        </span>
+      </div>
+      <div className={cn("max-w-[85%] rounded-lg border border-border px-3.5 py-2.5 text-sm", isUser ? "bg-foreground/5" : "bg-card")}>
+        <Markdown content={message.text} />
+        {message.openPoints.length > 0 ? (
+          <div className="mt-2 border-t border-border pt-2 text-xs">
+            <span className="font-medium text-muted-foreground">Open</span>
+            <ol className="mt-1 list-decimal space-y-0.5 pl-5">
+              {message.openPoints.map((point, index) => (
+                <li key={index}>{point}</li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
+function JobBanner({ job, onResume, onVerdict, disabled }: { job: NonNullable<Job>; onResume: () => void; onVerdict: () => void; disabled: boolean }) {
+  const roster = job.current !== null ? `@${job.current} is responding` : "";
+  const text = job.paused
+    ? `Paused. @${job.paused.handle} needs input: ${job.paused.question}`
+    : `Debate · turn ${job.turn}/${job.totalTurns}${roster ? ` · ${roster}` : ""}`;
+  return (
+    <div className="flex flex-wrap items-center gap-3 border-t border-border bg-card px-4 py-2 text-xs">
+      {job.paused ? (
+        <Icon name="Pause" className="size-3.5 text-muted-foreground" />
+      ) : (
+        <Icon name="Loading" className="size-3.5 animate-spin text-muted-foreground" />
+      )}
+      <span className="min-w-0 flex-1">{text}</span>
+      {job.paused ? (
+        <Button variant="outline" size="sm" onClick={onResume} disabled={disabled}>
+          <Icon name="Play" className="size-3.5" />
+          Resume
+        </Button>
+      ) : null}
+      <Button variant="outline" size="sm" onClick={onVerdict} disabled={disabled}>
+        <Icon name="Square" className="size-3.5" />
+        Verdict now
+      </Button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Seat chip
+// ---------------------------------------------------------------------------
+
+function SeatChip({ seat, isChief, onOpenThread }: { seat: Seat; isChief: boolean; onOpenThread: () => void }) {
+  return (
+    <span className="relative inline-flex items-stretch overflow-visible rounded-full border border-border text-xs">
+      <span
+        className="inline-flex items-center gap-1.5 rounded-l-full px-2.5 py-1"
+        title={`${seat.providerId}${seat.model ? ` · ${seat.model}` : ""}${seat.reasoningLevel ? ` · ${seat.reasoningLevel}` : ""}${seat.canEdit ? " · may edit" : ""}`}
+      >
+        <StatusDot seat={seat} />
+        <span className="font-medium">@{seat.handle}</span>
+        <span className="text-muted-foreground">{seat.providerId}</span>
+        {isChief ? <Icon name="Star" className="size-3 text-muted-foreground" aria-label="Chief" /> : null}
+        {seat.canEdit ? <Icon name="Edit" className="size-3 text-muted-foreground" aria-label="May edit files" /> : null}
+        {seat.lastStance ? <StanceBadge stance={seat.lastStance} small /> : null}
+      </span>
+      <button
+        type="button"
+        onClick={onOpenThread}
+        disabled={seat.threadId === null}
+        title={seat.threadId === null ? "No thread yet" : "Open the seat's thread in bb"}
+        aria-label={`Open @${seat.handle} thread`}
+        className="inline-flex items-center rounded-r-full border-l border-border px-1.5 text-muted-foreground hover:bg-state-hover hover:text-foreground disabled:opacity-40"
+      >
+        <Icon name="PanelRight" className="size-3.5" />
+      </button>
+    </span>
+  );
+}
+
+type ReasoningLevel = NonNullable<SeatInput["reasoningLevel"]> & string;
+const REASONING_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+
+interface SeatDraft {
+  handle: string;
+  providerId: string;
+  model: string;
+  reasoningLevel: ReasoningLevel | "";
+  canEdit: boolean;
+}
+
+const selectClass =
+  "h-8 rounded-md border border-input bg-background px-2 text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
+
+function toSeatInput(seat: SeatDraft) {
+  return {
+    handle: seat.handle.trim().toLowerCase(),
+    providerId: seat.providerId,
+    ...(seat.model ? { model: seat.model } : {}),
+    ...(seat.reasoningLevel ? { reasoningLevel: seat.reasoningLevel } : {}),
+    canEdit: seat.canEdit,
+  };
+}
+
+function defaultSeats(options: ContextOptions): SeatDraft[] {
+  const available = options.providers.filter((p) => p.available);
+  const has = (id: string) => available.some((p) => p.id === id);
+  const seats: SeatDraft[] = [];
+  const seat = (handle: string, providerId: string): SeatDraft => ({ handle, providerId, model: "", reasoningLevel: "", canEdit: false });
+  if (has("claude-code")) seats.push(seat("claude", "claude-code"));
+  if (has("codex")) seats.push(seat("codex", "codex"));
+  if (seats.length === 0 && available[0]) seats.push(seat(available[0].id.replace(/[^a-z0-9-]/g, ""), available[0].id));
+  return seats;
+}
+
+function SeatEditor({ seat, options, onChange, onRemove }: { seat: SeatDraft; options: ContextOptions; onChange: (patch: Partial<SeatDraft>) => void; onRemove?: () => void }) {
+  const provider = options.providers.find((p) => p.id === seat.providerId);
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card p-2">
+      <span className="text-xs text-muted-foreground">@</span>
+      <Input
+        value={seat.handle}
+        onChange={(e) => onChange({ handle: e.target.value })}
+        placeholder="handle"
+        pattern="[a-z][a-z0-9-]{0,23}"
+        title="lowercase letters, digits, dashes"
+        required
+        className="h-8 w-28 text-xs"
+        aria-label="Handle"
+      />
+      <select value={seat.providerId} onChange={(e) => onChange({ providerId: e.target.value, model: "" })} className={selectClass} aria-label="Provider">
+        {options.providers.map((p) => (
+          <option key={p.id} value={p.id} disabled={!p.available}>
+            {p.displayName}
+            {p.available ? "" : " (unavailable)"}
+          </option>
+        ))}
+      </select>
+      <select value={seat.model} onChange={(e) => onChange({ model: e.target.value })} className={selectClass} aria-label="Model">
+        <option value="">default model</option>
+        {(provider?.models ?? []).map((m) => (
+          <option key={m.model} value={m.model}>
+            {m.displayName}
+            {m.isDefault ? " (default)" : ""}
+          </option>
+        ))}
+      </select>
+      {(provider?.reasoningLevels.length ?? 0) > 0 ? (
+        <select value={seat.reasoningLevel} onChange={(e) => { const next = e.target.value; onChange({ reasoningLevel: next === "" || (REASONING_LEVELS as readonly string[]).includes(next) ? next as ReasoningLevel | "" : "" }); }} className={selectClass} aria-label="Reasoning">
+          <option value="">default reasoning</option>
+          {(provider?.reasoningLevels ?? [])
+            .filter((level): level is ReasoningLevel => (REASONING_LEVELS as readonly string[]).includes(level))
+            .map((level) => (
+              <option key={level} value={level}>
+                {level}
+              </option>
+            ))}
+        </select>
+      ) : null}
+      <label className="inline-flex items-center gap-1.5 text-xs text-muted-foreground" title="Read-only seats inspect the workspace but never change it">
+        <input type="checkbox" checked={seat.canEdit} onChange={(e) => onChange({ canEdit: e.target.checked })} className="size-3.5" />
+        may edit files
+      </label>
+      {onRemove ? (
+        <Button type="button" variant="ghost" size="icon" className="ml-auto size-7 text-muted-foreground hover:text-foreground" aria-label="Remove seat" onClick={onRemove}>
+          <Icon name="Trash2" className="size-4" />
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+function CreateCouncilForm({ onCreated, onCancel }: { onCreated: (councilId: string) => void; onCancel: () => void }) {
   const rpc = useRpc<Contract>();
   const [options, setOptions] = useState<ContextOptions | null>(null);
   const [title, setTitle] = useState("");
   const [projectId, setProjectId] = useState("");
-  const [seatsText, setSeatsText] = useState("claude=claude-code,codex=acp-codex");
-  const [chief, setChief] = useState("claude");
+  const [seats, setSeats] = useState<SeatDraft[]>([]);
+  const [chief, setChief] = useState("");
   const [turns, setTurns] = useState(8);
   const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
 
   useEffect(() => {
     rpc.call("context_options").then(
       (result) => {
         setOptions(result);
-        if (result.projects.length > 0) setProjectId((current) => current || result.projects[0].id);
+        const defaults = defaultSeats(result);
+        setSeats(defaults);
+        setChief(defaults[0]?.handle ?? "");
+        setProjectId((current) => current || result.projects[0]?.id || "");
       },
       (cause: unknown) => setError(describeError(cause)),
     );
   }, [rpc]);
 
-  const submit = () => {
-    const seats = seatsText
-      .split(",")
-      .map((entry) => entry.trim())
-      .filter((entry) => entry.length > 0)
-      .map((entry) => {
-        const [head, flag] = entry.split(":");
-        const [handle, providerId, model] = head.split("=");
-        return {
-          handle: (handle ?? "").trim(),
-          providerId: (providerId ?? "").trim(),
-          ...(model ? { model: model.trim() } : {}),
-          canEdit: flag === "edit",
-        };
-      });
-    rpc
-      .call("councils_create", {
-        title,
+  const update = (index: number, patch: Partial<SeatDraft>) => setSeats((current) => current.map((s, i) => (i === index ? { ...s, ...patch } : s)));
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (pending || options === null) return;
+    setPending(true);
+    setError(null);
+    try {
+      const { council } = await rpc.call("councils_create", {
+        title: title.trim(),
         projectId,
-        seats,
-        chief: chief.trim() || seats[0]?.handle || "",
+        seats: seats.map(toSeatInput),
+        chief: chief.trim() || seats[0]?.handle.trim().toLowerCase() || "",
         defaultTurns: turns,
-      })
-      .then(props.onDone, (cause: unknown) => setError(describeError(cause)));
+      });
+      onCreated(council.id);
+    } catch (cause) {
+      setError(describeError(cause));
+    } finally {
+      setPending(false);
+    }
   };
 
-  return (
-    <div style={{ display: "grid", gap: 8 }}>
-      <h3 style={{ margin: "4px 0" }}>New council</h3>
-      {error !== null && <p style={{ color: "#dc2626" }}>{error}</p>}
-      <label>
-        Title
-        <input value={title} onChange={(event) => setTitle(event.target.value)} style={{ width: "100%" }} />
-      </label>
-      <label>
-        Project
-        <select value={projectId} onChange={(event) => setProjectId(event.target.value)} style={{ width: "100%" }}>
-          {(options?.projects ?? []).map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label>
-        Seats (handle=provider[=model][:edit], comma-separated)
-        <input value={seatsText} onChange={(event) => setSeatsText(event.target.value)} style={{ width: "100%" }} />
-      </label>
-      {options !== null && (
-        <div style={{ fontSize: 12, opacity: 0.75 }}>
-          Known providers: {options.providers.map((provider) => provider.id).join(", ") || "(none)"}
-        </div>
-      )}
-      <label>
-        Chief (writes the verdict)
-        <input value={chief} onChange={(event) => setChief(event.target.value)} style={{ width: "100%" }} />
-      </label>
-      <label>
-        Turn budget
-        <input type="number" min={2} max={40} value={turns} onChange={(event) => setTurns(Number(event.target.value))} style={{ width: 90 }} />
-      </label>
-      <div style={{ display: "flex", gap: 8 }}>
-        <button onClick={submit} disabled={title === "" || projectId === ""}>
-          Create
-        </button>
+  if (options === null) {
+    return (
+      <div className="p-4">
+        {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : <EmptyState>Loading providers…</EmptyState>}
       </div>
+    );
+  }
+
+  const handles = seats.map((s) => s.handle.trim().toLowerCase()).filter((h) => h !== "");
+
+  return (
+    <div className="h-full min-h-0 overflow-y-auto p-4 md:p-5">
+      <form onSubmit={submit} className="mx-auto w-full max-w-3xl space-y-4">
+        <div>
+          <h2 className="text-sm font-semibold">New council</h2>
+          <p className="text-xs text-muted-foreground">
+            Every seat gets its own thread in one shared workspace; threads are created when you convene. What each agent should do goes in your question; the council only tells them how the stance footer and the turn budget work.
+          </p>
+        </div>
+        <label className="block space-y-1 text-xs text-muted-foreground">
+          Title
+          <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="DB choice" required />
+        </label>
+        <label className="block space-y-1 text-xs text-muted-foreground">
+          Project
+          <select value={projectId} onChange={(event) => setProjectId(event.target.value)} className={cn(selectClass, "block h-9 w-full")}>
+            {options.projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-muted-foreground">Seats</span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                const first = options.providers.find((p) => p.available) ?? options.providers[0];
+                if (!first) return;
+                setSeats((current) => [...current, { handle: "", providerId: first.id, model: "", reasoningLevel: "", canEdit: false }]);
+              }}
+            >
+              <Icon name="Plus" className="size-4" />
+              Add seat
+            </Button>
+          </div>
+          <div className="space-y-2">
+            {seats.map((seat, index) => (
+              <SeatEditor key={index} seat={seat} options={options} onChange={(patch) => update(index, patch)} onRemove={() => setSeats((current) => current.filter((_, i) => i !== index))} />
+            ))}
+          </div>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block space-y-1 text-xs text-muted-foreground">
+            Chief (writes the verdict)
+            <select value={chief} onChange={(event) => setChief(event.target.value)} className={cn(selectClass, "block h-9 w-full")}>
+              {handles.map((h) => (
+                <option key={h} value={h}>
+                  @{h}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            Turn budget
+            <Input
+              type="number"
+              min={2}
+              max={MAX_TURNS}
+              value={turns}
+              onChange={(event) => setTurns(Math.min(MAX_TURNS, Math.max(2, Number(event.target.value) || 8)))}
+              className="h-8 w-16 text-xs"
+            />
+            <span>how many seat replies before the chief synthesizes</span>
+          </label>
+        </div>
+
+        {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
+        <div className="flex items-center gap-2">
+          <Button type="submit" disabled={pending || seats.length < 2 || title.trim() === "" || projectId === ""}>
+            <Icon name="MessageSquarePlus" className="size-4" />
+            Create council
+          </Button>
+          <Button type="button" variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+        </div>
+      </form>
     </div>
   );
 }
 
-function CouncilRoom(props: { councilId: string; onBack: () => void }) {
-  const rpc = useRpc<Contract>();
-  const { detail, error, refetch } = useCouncil(props.councilId);
-  const [draft, setDraft] = useState("");
-  const [turns, setTurns] = useState<number | "">("");
+// ---------------------------------------------------------------------------
+// Council room
+// ---------------------------------------------------------------------------
+
+function CouncilRoom({ councilId, compact = false }: { councilId: string; compact?: boolean }) {
+  const { rpc, detail, error, refetch } = useCouncil(councilId);
+  const navigate = useBbNavigate();
+  const [text, setText] = useState("");
+  const [turns, setTurns] = useState<number | null>(null);
+  const [pendingAction, setPendingAction] = useState<"convene" | "say" | "resume" | "halt" | "verdict" | "archive" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottom = useRef(true);
 
-  const convene = () => {
-    if (draft.trim() === "") return;
-    rpc
-      .call("councils_convene", {
-        councilId: props.councilId,
-        question: draft.trim(),
-        ...(turns === "" ? {} : { turns }),
-      })
-      .then(
-        () => {
-          setDraft("");
-          refetch();
-        },
-        (cause: unknown) => setActionError(describeError(cause)),
-      );
+  const now = useTicker(detail?.seats.some(isWorking) ?? false);
+
+  useEffect(() => {
+    const el = listRef.current;
+    if (el === null || !stickToBottom.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [detail?.messages.length, detail?.job?.current]);
+
+  const onScroll = () => {
+    const el = listRef.current;
+    if (el === null) return;
+    stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
   };
 
-  const say = () => {
-    if (draft.trim() === "") return;
-    rpc.call("councils_say", { councilId: props.councilId, text: draft.trim() }).then(
-      () => {
-        setDraft("");
-        refetch();
-      },
-      (cause: unknown) => setActionError(describeError(cause)),
+  const run = async (action: NonNullable<typeof pendingAction>, fn: () => Promise<unknown>) => {
+    if (pendingAction !== null) return;
+    setPendingAction(action);
+    setActionError(null);
+    try {
+      await fn();
+    } catch (cause) {
+      setActionError(describeError(cause));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const afterSend = () => {
+    setText("");
+    stickToBottom.current = true;
+    refetch();
+  };
+
+  const convene = () =>
+    run("convene", async () => {
+      const body = text.trim();
+      if (body === "") return;
+      await rpc.call("councils_convene", { councilId, question: body, ...(turns === null ? {} : { turns }) });
+      afterSend();
+    });
+
+  const say = () =>
+    run("say", async () => {
+      const body = text.trim();
+      if (body === "") return;
+      await rpc.call("councils_say", { councilId, text: body });
+      afterSend();
+    });
+
+  const resume = () => run("resume", () => rpc.call("councils_resume", { councilId }));
+  const verdict = () => run("verdict", () => rpc.call("councils_verdict", { councilId }));
+  const halt = () =>
+    run("halt", async () => {
+      if (!window.confirm("Stop every running seat?")) return;
+      await rpc.call("councils_halt", { councilId });
+      refetch();
+    });
+  const archive = () =>
+    run("archive", async () => {
+      if (!window.confirm("Archive this council?")) return;
+      await rpc.call("councils_archive", { councilId });
+      if (!compact) navigate.toPluginPanel(PANEL_PATH, { replace: true });
+    });
+
+  if (error !== null) {
+    return (
+      <div className="p-4">
+        <p role="alert" className="text-sm text-destructive">{error}</p>
+      </div>
     );
-  };
+  }
+  if (detail === null) {
+    return (
+      <div className="p-4">
+        <EmptyState>Loading council…</EmptyState>
+      </div>
+    );
+  }
 
-  if (error !== null) return <p style={{ color: "#dc2626" }}>{error}</p>;
-  if (detail === null) return <p>Loading…</p>;
   const { council, seats, messages, job } = detail;
+  const providerOf = (handle: string) => seats.find((s) => s.handle === handle)?.providerId ?? null;
+  const working = seats.filter(isWorking);
+  const effectiveTurns = turns ?? council.defaultTurns;
+  const primaryDisabled = text.trim() !== "" && pendingAction === null;
 
   return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-        <h3 style={{ margin: "4px 0" }}>
-          {council.title}{" "}
-          <span style={{ color: statusColor(council.status), fontSize: 12 }}>[{council.status}]</span>
-        </h3>
-        <button onClick={props.onBack}>All councils</button>
-      </div>
-      <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
+    <div className="flex h-full min-h-0 flex-col">
+      <header className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-2">
+        <div className="min-w-0 flex-1">
+          <h2 className="truncate text-sm font-semibold">
+            {council.title} <span className={cn("text-xs font-normal", STATUS_STYLE[council.status] ?? "text-muted-foreground")}>[{council.status}]</span>
+          </h2>
+        </div>
+        {council.status === "convened" ? (
+          <Button variant="outline" size="sm" onClick={halt} disabled={pendingAction !== null} aria-label="Stop every running seat">
+            <Icon name="Square" className="size-3.5" />
+            Halt
+          </Button>
+        ) : null}
+        <Button variant="ghost" size="sm" onClick={archive} disabled={pendingAction !== null} aria-label="Archive council">
+          <Icon name="Archive" className="size-4" />
+        </Button>
+      </header>
+
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-border px-4 py-2">
         {seats.map((seat) => (
-          <span key={seat.handle} style={badgeStyles}>
-            {seat.isChief ? "★ " : ""}
-            @{seat.handle} · {seat.providerId}
-            {seat.lastStance !== null ? ` · ${seat.lastStance}` : ""}
-            {seat.status !== null ? ` · ${seat.status}` : ""}
-          </span>
+          <SeatChip key={seat.handle} seat={seat} isChief={seat.isChief} onOpenThread={() => { if (seat.threadId !== null) navigate.toThread(seat.threadId); }} />
         ))}
       </div>
-      {job !== null && (
-        <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
-          Debate: turn {job.turn}/{job.totalTurns}
-          {job.current !== null ? ` · speaking: @${job.current}` : ""}
-          {job.paused !== null ? ` · PAUSED — @${job.paused.handle} asks: ${job.paused.question}` : ""}
-        </div>
-      )}
-      <div style={{ display: "grid", gap: 10, maxHeight: "55vh", overflowY: "auto" }}>
-        {messages.map((message) => (
-          <div key={message.seq} style={{ borderBottom: "1px solid var(--bb-border, #8882)", paddingBottom: 8 }}>
-            <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 2 }}>
-              #{message.seq} · {message.author === "user" ? "MODERATOR" : `@${message.author}`}
-              {message.stance !== null && message.author !== "system" && (
-                <span style={{ color: stanceBadgeColor(message.stance), fontWeight: 600, marginLeft: 8 }}>
-                  [{message.stance}]
-                </span>
-              )}
-            </div>
-            <Markdown content={message.text} />
+
+      <div ref={listRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-4">
+        {messages.length === 0 ? (
+          <div className="py-6">
+            <EmptyState>Convene with a question. Every seat answers in parallel; the debate runs until consensus or the turn cap.</EmptyState>
           </div>
-        ))}
+        ) : (
+          <ul className="mx-auto w-full max-w-3xl divide-y divide-border/60">
+            {messages.map((message) => (
+              <MessageRow key={message.seq} message={message} providerOf={providerOf} />
+            ))}
+            {working.map((seat) => (
+              <WorkingRow key={`working-${seat.handle}`} seat={seat} now={now} />
+            ))}
+          </ul>
+        )}
       </div>
-      {actionError !== null && <p style={{ color: "#dc2626" }}>{actionError}</p>}
-      <div style={composerStyles}>
+
+      {job !== null ? <JobBanner job={job} onResume={resume} onVerdict={verdict} disabled={pendingAction !== null} /> : null}
+
+      <form
+        className="border-t border-border px-4 py-3"
+        onSubmit={(event: FormEvent<HTMLFormElement>) => {
+          event.preventDefault();
+          if (council.status === "idle") void convene();
+          else void say();
+        }}
+      >
         <textarea
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          placeholder={council.status === "paused" ? "Answer the paused seat…" : "Convene with a question…"}
-          style={textareaStyles}
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          rows={3}
+          placeholder={
+            job?.paused
+              ? `Answer @${job.paused.handle}; sending resumes the debate…`
+              : council.status === "idle"
+                ? "The question every seat answers…"
+                : "Interject as the moderator…"
+          }
+          aria-label={council.status === "idle" ? "Question" : "Message"}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              if (council.status === "idle") void convene();
+              else void say();
+            }
+          }}
+          className="w-full resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
         />
-        <div style={{ display: "grid", gap: 6 }}>
-          {council.status === "idle" && (
-            <label style={{ fontSize: 12 }}>
-              Turns
-              <input
-                type="number"
-                min={2}
-                max={40}
-                value={turns}
-                onChange={(event) => setTurns(event.target.value === "" ? "" : Number(event.target.value))}
-                style={{ width: 70 }}
-              />
-            </label>
-          )}
-          {council.status === "idle" && <button onClick={convene}>Convene</button>}
-          {(council.status === "paused" || council.status === "convened") && <button onClick={say}>Say</button>}
-          {council.status === "paused" && (
-            <button
-              onClick={() =>
-                rpc.call("councils_resume", { councilId: props.councilId }).then(refetch, (cause: unknown) => setActionError(describeError(cause)))
-              }
-            >
-              Resume
-            </button>
-          )}
-          {council.status === "convened" && (
-            <button
-              onClick={() =>
-                rpc.call("councils_halt", { councilId: props.councilId }).then(refetch, (cause: unknown) => setActionError(describeError(cause)))
-              }
-            >
-              Halt
-            </button>
-          )}
-          {(council.status === "convened" || council.status === "paused") && (
-            <button
-              onClick={() =>
-                rpc.call("councils_verdict", { councilId: props.councilId }).then(refetch, (cause: unknown) => setActionError(describeError(cause)))
-              }
-            >
-              Verdict now
-            </button>
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-muted-foreground">
+            {council.status === "idle"
+              ? `Convene posts this to every seat at once under a ${effectiveTurns}-turn budget.`
+              : council.status === "paused"
+                ? "Sending answers the paused seat and resumes the debate."
+                : "Sending posts as the moderator; the current speaker sees it."}
+          </span>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            {council.status === "idle" ? (
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground" title="Seat replies before the chief synthesizes">
+                Turns
+                <Input
+                  type="number"
+                  min={2}
+                  max={MAX_TURNS}
+                  value={effectiveTurns}
+                  onChange={(event) => setTurns(Math.min(MAX_TURNS, Math.max(2, Number(event.target.value) || 8)))}
+                  className="h-8 w-14 text-xs"
+                  aria-label="Turns"
+                />
+              </label>
+            ) : null}
+            {council.status === "idle" ? (
+              <Button type="submit" size="sm" disabled={!primaryDisabled}>
+                <Icon name="Zap" className="size-3.5" />
+                Convene
+              </Button>
+            ) : (
+              <Button type="submit" size="sm" disabled={!primaryDisabled}>
+                <Icon name="Sent" className="size-3.5" />
+                Say
+              </Button>
+            )}
+          </div>
+        </div>
+        {actionError !== null ? <p role="alert" className="mt-2 text-xs text-destructive">{actionError}</p> : null}
+      </form>
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Page: list + room
+// ---------------------------------------------------------------------------
+
+function CouncilListItem({ council, active, onSelect }: { council: CouncilSummary; active: boolean; onSelect: () => void }) {
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-current={active ? "page" : undefined}
+        className={cn("w-full rounded-md px-2.5 py-2 text-left hover:bg-state-hover", active && "bg-state-active")}
+      >
+        <div className="flex items-center gap-1.5 truncate text-sm font-medium">
+          {council.status === "convened" ? <Icon name="Loading" className="size-3 animate-spin text-muted-foreground" /> : null}
+          {council.title}
+        </div>
+        <div className="truncate text-xs text-muted-foreground">
+          {council.handles.map((h) => `@${h}`).join(" ")} · {council.messageCount} msg
+          {council.lastAuthor !== null ? ` · last ${council.lastAuthor === "user" ? "you" : `@${council.lastAuthor}`}` : ""}
+        </div>
+      </button>
+    </li>
+  );
+}
+
+function CouncilPage({ subPath }: { subPath: string }) {
+  const { councils, error } = useCouncils();
+  const navigate = useBbNavigate();
+  const [head] = subPath.split("/");
+  const creating = head === "new";
+  const councilId = !creating && head !== "" ? head : null;
+
+  return (
+    <div className="flex h-full min-h-0">
+      <aside className="flex w-60 shrink-0 flex-col border-r border-border">
+        <div className="flex items-center justify-between px-3 py-2.5">
+          <span className="text-xs font-medium text-muted-foreground">Councils</span>
+          <Button variant="ghost" size="sm" onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: "new" })}>
+            <Icon name="Plus" className="size-4" />
+            New
+          </Button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-1.5 pb-2">
+          {error ? (
+            <p role="alert" className="px-2 text-xs text-destructive">{error}</p>
+          ) : councils === null ? (
+            <p className="px-2 text-xs text-muted-foreground">Loading…</p>
+          ) : councils.length === 0 ? (
+            <p className="px-2 text-xs text-muted-foreground">No councils yet.</p>
+          ) : (
+            <ul className="space-y-0.5">
+              {councils.map((council) => (
+                <CouncilListItem key={council.id} council={council} active={council.id === councilId} onSelect={() => navigate.toPluginPanel(PANEL_PATH, { subPath: council.id })} />
+              ))}
+            </ul>
           )}
         </div>
-      </div>
+      </aside>
+      <main className="min-w-0 flex-1">
+        {creating ? (
+          <CreateCouncilForm onCreated={(id) => navigate.toPluginPanel(PANEL_PATH, { subPath: id, replace: true })} onCancel={() => navigate.toPluginPanel(PANEL_PATH, { replace: true })} />
+        ) : councilId !== null ? (
+          <CouncilRoom key={councilId} councilId={councilId} />
+        ) : (
+          <div className="p-6">
+            <EmptyState>
+              Pick a council or create one. Convene posts one question to every seat in parallel; the debate runs until consensus or the turn budget, then the chief writes the verdict.
+            </EmptyState>
+          </div>
+        )}
+      </main>
     </div>
   );
 }
@@ -379,15 +818,6 @@ export default definePluginApp((app) => {
     title: "Council",
     icon: "Users",
     path: PANEL_PATH,
-    component: () => {
-      const { councils, error } = useCouncils();
-      const [creating, setCreating] = useState(false);
-      const [openId, setOpenId] = useState<string | null>(null);
-      if (openId !== null) return <CouncilRoom councilId={openId} onBack={() => setOpenId(null)} />;
-      if (creating) return <CreateCouncilForm onDone={() => setCreating(false)} />;
-      if (error !== null) return <p style={{ color: "#dc2626" }}>{error}</p>;
-      if (councils === null) return <p>Loading…</p>;
-      return <CouncilList councils={councils} onOpen={setOpenId} onCreate={() => setCreating(true)} />;
-    },
+    component: CouncilPage,
   });
 });

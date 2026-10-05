@@ -1,17 +1,30 @@
 {
   "compilerOptions": {
+    "strict": true,
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2024", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
-    "strict": true,
+    "lib": [
+      "ES2024",
+      "DOM"
+    ],
+    "types": [
+      "node"
+    ],
+    "paths": {
+      "@/*": [
+        "./*"
+      ]
+    },
     "noEmit": true,
-    "skipLibCheck": true,
-    "esModuleInterop": true,
-    "isolatedModules": true,
-    "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+    "skipLibCheck": false
   },
-  "include": ["server.ts", "app.tsx", "skills/council/SKILL.md"]
+  "include": [
+    "server.ts",
+    "app.tsx",
+    "components",
+    "lib",
+    "hooks"
+  ]
 }
