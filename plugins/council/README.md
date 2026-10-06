@@ -17,12 +17,37 @@ verdict, then a chief seat synthesizes the debate.
   transcript; the verdict is recorded and stamped into the council.
 - Seats are read-only unless marked `:edit`.
 
+The **New council** form defaults to GLM 5.3 Flash on OMP (chief), Codex
+(default model), Claude Code (default model), and DeepSeek v4 Flash on OMP.
+The OMP seats use `webster/glm-5.3-flash` and `webster/deepseek-v4-flash`
+explicitly, with file editing enabled. Unavailable providers are skipped;
+a missing model catalog never changes an explicit model to the provider default.
+Chief follows the selected seat when its handle changes. Removing it selects
+the first remaining seat. Handles and other fields are validated before submit,
+and RPC validation errors identify the affected field. CLI creation still uses
+explicit `--seats`.
+
+## Slash command
+
+Invoke `/council <question>` in a BB thread to start the four-seat preset in
+that thread's workspace. With no question, the agent uses the clear current
+problem or asks what to discuss. GLM chairs; Codex and Claude's default models
+are resolved and saved at launch. The launcher checks that all four choices
+are available before creating a council. It reports any seat startup failures.
+
+The launcher uses the `councils_launch` RPC with `projectId`, `environmentId`,
+`question`, and optional `title`/`turns`. Its result contains `council` and
+`failures` (seat handle and error). `/council-seat` is the separate participant
+protocol; it never launches a nested council. The debate appears in the Council
+panel; `bb council show <id>` reads the transcript.
+
 ## Files
 
 - `server.ts` — SQLite store, spawn/relay, footer parsing, debate scheduler,
   synthesis, RPC, the `bb council` CLI.
 - `app.tsx` — **Council** nav panel: council list, transcript, convene/resume.
-- `skills/council/SKILL.md` — the protocol every seat is given.
+- `skills/council/SKILL.md` — `/council` launcher and its safe JSON/RPC helper.
+- `skills/council-seat/SKILL.md` — the participant protocol used by seat threads.
 
 ## Develop
 
@@ -30,7 +55,8 @@ verdict, then a chief seat synthesizes the debate.
 npm install
 bb plugin install .
 bb plugin dev            # rebuild + reload on save
-npx tsc -p .             # type-check
+npm run typecheck
+npm test                # rendered-form and backend contract regressions
 bb plugin logs council
 ```
 

@@ -10,20 +10,17 @@
 // turn cap, or a need-info pause; the chief seat then synthesizes the verdict.
 import { defineRpcContract, type BbPluginApi, type PluginCliResult } from "@get-bb/plugin-sdk";
 import { randomUUID } from "node:crypto";
+import { DEFAULT_SEATS, DEFAULT_CHIEF, DEFAULT_TURNS } from "./lib/default-roster";
 import type Database from "better-sqlite3";
 import { z } from "zod";
+import { HANDLE_RE, REASONING_LEVELS, MAX_TURNS, turnsSchema, seatInputSchema, createCouncilInputSchema, describeInputIssues } from "./lib/council-input";
 
 // ---------------------------------------------------------------------------
 // Wire schemas (shared with app.tsx through type-only imports)
 // ---------------------------------------------------------------------------
 
-const HANDLE_RE = /^[a-z][a-z0-9-]{0,23}$/;
-const handleSchema = z
-  .string()
-  .regex(HANDLE_RE, "handle must be lowercase letters, digits, or dashes");
-const REASONING_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
-const reasoningSchema = z.enum(REASONING_LEVELS);
-type ReasoningLevel = z.infer<typeof reasoningSchema>;
+export { MAX_TURNS, seatInputSchema } from "./lib/council-input";
+type ReasoningLevel = NonNullable<SeatInput["reasoningLevel"]>;
 
 export const STANCES = ["agree", "disagree", "need-info", "pass"] as const;
 const stanceSchema = z.enum(STANCES);
@@ -32,16 +29,6 @@ export type Stance = z.infer<typeof stanceSchema>;
 const briefSchema = z.enum(["full", "summary", "none"]);
 export type Brief = z.infer<typeof briefSchema>;
 
-export const MAX_TURNS = 40;
-const turnsSchema = z.number().int().min(2).max(MAX_TURNS);
-
-export const seatInputSchema = z.object({
-  handle: handleSchema,
-  providerId: z.string().min(1),
-  model: z.string().min(1).nullable().optional(),
-  reasoningLevel: reasoningSchema.nullable().optional(),
-  canEdit: z.boolean().optional(),
-});
 export type SeatInput = z.infer<typeof seatInputSchema>;
 
 export const seatSchema = z.object({
@@ -135,18 +122,24 @@ export type ContextOptions = z.infer<typeof contextOptionsSchema>;
 const okSchema = z.object({ ok: z.literal(true) });
 const councilIdSchema = z.object({ councilId: z.string() });
 const textSchema = z.string().trim().min(1).max(20_000);
+const launchInputSchema = z.object({
+  projectId: z.string().min(1),
+  environmentId: z.string().min(1),
+  title: z.string().trim().min(1).max(120).optional(),
+  question: textSchema,
+  turns: turnsSchema.optional(),
+});
+const deliveryFailureSchema = z.object({ handle: z.string(), error: z.string() });
 
 export const rpcContract = defineRpcContract({
   councils_list: { input: z.null(), output: z.object({ councils: z.array(councilSummarySchema) }) },
   councils_create: {
-    input: z.object({
-      title: z.string().trim().min(1).max(120),
-      projectId: z.string().min(1),
-      seats: z.array(seatInputSchema).min(2).max(8),
-      chief: handleSchema,
-      defaultTurns: turnsSchema.optional(),
-    }),
+    input: createCouncilInputSchema,
     output: z.object({ council: councilSchema }),
+  },
+  councils_launch: {
+    input: launchInputSchema,
+    output: z.object({ council: councilSchema, failures: z.array(deliveryFailureSchema) }),
   },
   councils_get: { input: councilIdSchema, output: councilDetailSchema },
   /** Convene: post the question and start the debate under a turn budget. */
@@ -532,7 +525,11 @@ export default async function plugin(bb: BbPluginApi) {
       seatRow.is_chief
         ? "As chief, you will write the final verdict when the debate ends."
         : "Argue honestly; your stance footer decides whether the debate continues.",
-      "Follow the council skill protocol: end every reply with STANCE and OPEN lines.",
+      "Follow the council-seat skill protocol: end every reply with STANCE and OPEN lines.",
+      "You are already a participant. Do not invoke /council or create another council.",
+      seatRow.can_edit
+        ? "You may edit files only when the moderator's question calls for changes."
+        : "This seat is read-only: inspect the workspace but do not change files.",
       "",
       prompt,
     ].join("\n");
@@ -611,10 +608,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   // -- Delivery --------------------------------------------------------------
 
-  async function deliver(councilId: string, handle: string, instruction: string): Promise<void> {
+  async function deliver(councilId: string, handle: string, instruction: string): Promise<string | null> {
     const councilRow = council(councilId);
     const seatRow = seat(councilId, handle);
-    if (councilRow === undefined || seatRow === undefined) return;
+    if (councilRow === undefined || seatRow === undefined) return `Seat @${handle} or its council no longer exists.`;
     const unseen = (q.messagesAll.all(councilId) as MessageRow[]).filter(
       (m) => m.seq > seatRow.last_seen_seq && m.author !== handle,
     );
@@ -645,7 +642,9 @@ export default async function plugin(bb: BbPluginApi) {
       const message = errorMessage(cause);
       bb.log.warn(`deliver to @${handle} in ${councilId} failed: ${message}`);
       postSystem(councilId, `Could not reach @${handle}: ${message}`);
+      return message;
     }
+    return null;
   }
 
   // -- Debate scheduler ------------------------------------------------------
@@ -750,27 +749,30 @@ export default async function plugin(bb: BbPluginApi) {
   // -- Debate operations (shared by RPC and CLI) -----------------------------
 
   async function opCreate(input: { title: string; projectId: string; seats: SeatInput[]; chief: string; defaultTurns: number }): Promise<CouncilRow> {
+    // The CLI and RPC must enforce the same rules before writing any rows.
+    const parsed = createCouncilInputSchema.safeParse(input);
+    if (!parsed.success) throw new Error(describeInputIssues(parsed.error));
+    input = { ...parsed.data, defaultTurns: parsed.data.defaultTurns ?? 8 };
     const providers = await providerDirectory();
     for (const s of input.seats) {
-      if (!providers.has(s.providerId)) throw new Error(`unknown provider ${s.providerId}`);
-    }
-    if (!input.seats.some((s) => s.handle === input.chief)) {
-      throw new Error(`chief ${input.chief} must be one of the seats`);
+      if (!providers.has(s.providerId)) throw new Error(`Seat @${s.handle}: unknown provider ${s.providerId}`);
     }
     const id = randomId();
     const now = Date.now();
-    q.insertCouncil.run(id, input.title, input.projectId, null, input.chief, input.defaultTurns, now, now);
-    for (const s of input.seats) {
-      q.insertSeat.run(id, s.handle, s.providerId, s.model ?? null, s.reasoningLevel ?? null, s.canEdit ? 1 : 0);
-    }
-    q.markChief.run(id, input.chief);
+    db.transaction(() => {
+      q.insertCouncil.run(id, input.title, input.projectId, null, input.chief, input.defaultTurns, now, now);
+      for (const s of input.seats) {
+        q.insertSeat.run(id, s.handle, s.providerId, s.model ?? null, s.reasoningLevel ?? null, s.canEdit ? 1 : 0);
+      }
+      q.markChief.run(id, input.chief);
+    })();
     postSystem(id, `Council "${input.title}" created. Seats: ${input.seats.map((s) => `@${s.handle} (${s.providerId})`).join(", ")}. Chief: @${input.chief}.`);
     const row = council(id);
     if (row === undefined) throw new Error("council vanished after create");
     return row;
   }
 
-  async function opConvene(councilId: string, question: string, turns: number): Promise<void> {
+  async function opConvene(councilId: string, question: string, turns: number): Promise<z.infer<typeof deliveryFailureSchema>[]> {
     if (council(councilId) === undefined) throw new Error(`council ${councilId} not found`);
     if (jobs.has(councilId)) throw new Error("a debate is already running in this council");
     store.appendMessage(councilId, "user", question);
@@ -779,7 +781,45 @@ export default async function plugin(bb: BbPluginApi) {
     publish(councilId);
     // The question goes to every seat at once; the chief answers too, then
     // moderates synthesis at the end.
-    await Promise.all(seats(councilId).map((s) => deliver(councilId, s.handle, INSTRUCTION_PARALLEL)));
+    const deliveries = await Promise.all(seats(councilId).map(async (s) => {
+      const error = await deliver(councilId, s.handle, INSTRUCTION_PARALLEL);
+      return error === null ? null : { handle: s.handle, error };
+    }));
+    return deliveries.filter((failure) => failure !== null);
+  }
+
+  async function opLaunch(input: z.infer<typeof launchInputSchema>) {
+    // Validate the exact four-seat preset on the caller's host before creating
+    // anything. A launch never silently drops or substitutes a requested seat.
+    const environment = await bb.sdk.environments.get({ environmentId: input.environmentId });
+    if (environment.projectId !== input.projectId) throw new Error("The workspace does not belong to the selected project.");
+    if (environment.status !== "ready") throw new Error("The workspace is not ready yet.");
+    const providers = await bb.sdk.providers.list({ environmentId: input.environmentId });
+    for (const providerId of new Set(DEFAULT_SEATS.map((seat) => seat.providerId))) {
+      if (!providers.some((provider) => provider.id === providerId && provider.available)) {
+        throw new Error(`The four-seat council requires ${providerId}, which is unavailable in this workspace.`);
+      }
+    }
+    const roster: SeatInput[] = [];
+    for (const providerId of new Set(DEFAULT_SEATS.map((seat) => seat.providerId))) {
+      const catalog = await bb.sdk.providers.models({ providerId, environmentId: input.environmentId });
+      for (const seat of DEFAULT_SEATS.filter((seat) => seat.providerId === providerId)) {
+        const model = seat.model || catalog.models.find((model) => model.isDefault)?.model;
+        if (!model || !catalog.models.some((entry) => entry.model === model)) {
+          throw new Error(`Seat @${seat.handle}: ${seat.model || "the default model"} is unavailable from ${providerId}.`);
+        }
+        roster.push({ ...seat, model });
+      }
+    }
+    roster.sort((a, b) => DEFAULT_SEATS.findIndex((s) => s.handle === a.handle) - DEFAULT_SEATS.findIndex((s) => s.handle === b.handle));
+    const turns = input.turns ?? DEFAULT_TURNS;
+    const row = await opCreate({
+      projectId: input.projectId, title: input.title ?? input.question.replace(/\s+/g, " ").slice(0, 120),
+      seats: roster, chief: DEFAULT_CHIEF, defaultTurns: turns,
+    });
+    q.updateCouncilEnvironment.run(input.environmentId, Date.now(), row.id);
+    const failures = await opConvene(row.id, input.question, turns);
+    return { council: councilRowToSchema(council(row.id)!), failures };
   }
 
   async function opSay(councilId: string, text: string): Promise<void> {
@@ -973,6 +1013,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     councils_list: () => ({ councils: (q.councilsAll.all() as CouncilRow[]).map(councilSummary) }),
     councils_create: async (input) => ({ council: councilRowToSchema(await opCreate({ ...input, defaultTurns: input.defaultTurns ?? 8 })) }),
+    councils_launch: opLaunch,
     councils_get: (input) => councilDetail(input.councilId),
     councils_convene: async (input) => {
       const row = council(input.councilId);

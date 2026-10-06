@@ -1,40 +1,35 @@
 # bb-lab
 
-Plugins and experiments for [bb](https://github.com/get-bb/bb), the agent IDE that builds itself.
+Plugins for [bb](https://github.com/get-bb/bb), the agent IDE that builds itself.
 
-| Plugin | What it does |
-| --- | --- |
-| [`plugins/council/`](plugins/council/) | **THE COUNCIL** — put the same problem in front of several agents on different providers, let them argue it out under a turn budget, then have a synthesizer merge the debate into one answer. |
+## Plugins
+
+| Plugin | What you get | Surface |
+| --- | --- | --- |
+| [`council`](plugins/council/) | Several agents on different providers argue one question under a turn budget; a chief seat synthesizes the debate into a recorded verdict. | Nav panel, `/council` slash command, `bb council` CLI |
+| [`usage-hud`](plugins/bb-plugin-usage-hud/) | Live inference metrics — context %, per-turn token breakdown, tok/s, TTFT, cost — as a fixed HUD in the bb window. | App overlay, `bb usage-hud` CLI |
+| [`ceo-interaction`](plugins/bb-plugin-ceo-interaction/) | A headless skill, injected into every agent thread, that gives agents a working contract for collaborating with you: steer with proposals, escalate only real decisions, conclude-first reports. | Skill (no UI or CLI) |
+
+Each plugin directory has its own README with full details.
 
 ## Install
 
 ```sh
 git clone https://github.com/athreesh/bb-lab.git
 cd bb-lab
-bb plugin install ./plugins/council
+bb plugin install ./plugins/council   # or usage-hud, ceo-interaction
 ```
 
-Iterate with `bb plugin reload council` (or `bb plugin dev` inside the plugin directory); type-check with `npx tsc -p .`.
+## Develop
 
-## Council quickstart
-
-Create a council, pick its seats, convene it — from the UI panel or the CLI:
+From a plugin directory:
 
 ```sh
-bb council create --title "DB choice" --project <id> \
-  --seats claude=claude-code,codex=acp-codex,grok=acp-grok --chief claude --turns 8
-bb council convene <council> "Should we use Postgres or SQLite for this service?"
+npm install
+bb plugin install .
+bb plugin reload <plugin-name>   # reload after changes
+bb plugin dev                    # rebuild + reload on save
 ```
-
-Every reply ends with a stance footer that the plugin parses to drive the debate:
-
-```
-STANCE: agree | disagree | need-info | pass
-OPEN:
-- one open point per line
-```
-
-The debate ends early once every seat is at `agree`/`pass` with nothing left open, when the turn budget runs out, or when someone blocks with `need-info` (you answer in the council, then resume). The chief writes the final synthesis and the verdict is recorded. Seats are read-only unless you mark them `:edit`.
 
 ## License
 

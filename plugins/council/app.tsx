@@ -22,19 +22,28 @@ import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { DEFAULT_SEATS, DEFAULT_CHIEF, DEFAULT_TURNS } from "./lib/default-roster";
+import { createCouncilInputSchema, describeInputIssues, MAX_TURNS, REASONING_LEVELS } from "./lib/council-input";
 
 type Contract = typeof rpcContract;
 
 const PANEL_ID = "councils";
 const PANEL_PATH = "councils";
 const COUNCIL_CHANGED = "council-changed";
-const MAX_TURNS = 40;
 
 // ---------------------------------------------------------------------------
 // Data hooks
 // ---------------------------------------------------------------------------
 
 function describeError(cause: unknown): string {
+  // BB preserves validation details on the thrown RPC error. Do not hide
+  // them behind its generic "rpc input validation failed" message.
+  if (cause instanceof Error && "issues" in cause && Array.isArray(cause.issues)) {
+    const issues = cause.issues.filter((issue): issue is { path?: (string | number)[]; message: string } =>
+      typeof issue === "object" && issue !== null && typeof issue.message === "string" &&
+      (issue.path === undefined || (Array.isArray(issue.path) && issue.path.every((part: unknown) => typeof part === "string" || typeof part === "number"))));
+    if (issues.length > 0) return describeInputIssues({ issues });
+  }
   return cause instanceof Error ? cause.message : String(cause);
 }
 
@@ -285,7 +294,6 @@ function SeatChip({ seat, isChief, onOpenThread }: { seat: Seat; isChief: boolea
 }
 
 type ReasoningLevel = NonNullable<SeatInput["reasoningLevel"]> & string;
-const REASONING_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 interface SeatDraft {
   handle: string;
@@ -310,12 +318,12 @@ function toSeatInput(seat: SeatDraft) {
 
 function defaultSeats(options: ContextOptions): SeatDraft[] {
   const available = options.providers.filter((p) => p.available);
-  const has = (id: string) => available.some((p) => p.id === id);
-  const seats: SeatDraft[] = [];
-  const seat = (handle: string, providerId: string): SeatDraft => ({ handle, providerId, model: "", reasoningLevel: "", canEdit: false });
-  if (has("claude-code")) seats.push(seat("claude", "claude-code"));
-  if (has("codex")) seats.push(seat("codex", "codex"));
-  if (seats.length === 0 && available[0]) seats.push(seat(available[0].id.replace(/[^a-z0-9-]/g, ""), available[0].id));
+  const seats: SeatDraft[] = DEFAULT_SEATS
+    .filter((seat) => available.some((provider) => provider.id === seat.providerId))
+    .map((seat) => ({ ...seat, reasoningLevel: "" }));
+  if (seats.length === 0 && available[0]) seats.push({
+    handle: "agent", providerId: available[0].id, model: "", reasoningLevel: "", canEdit: false,
+  });
   return seats;
 }
 
@@ -328,13 +336,12 @@ function SeatEditor({ seat, options, onChange, onRemove }: { seat: SeatDraft; op
         value={seat.handle}
         onChange={(e) => onChange({ handle: e.target.value })}
         placeholder="handle"
-        pattern="[a-z][a-z0-9-]{0,23}"
-        title="lowercase letters, digits, dashes"
+        title="1–24 letters, digits, or dashes, starting with a letter"
         required
         className="h-8 w-28 text-xs"
         aria-label="Handle"
       />
-      <select value={seat.providerId} onChange={(e) => onChange({ providerId: e.target.value, model: "" })} className={selectClass} aria-label="Provider">
+      <select value={seat.providerId} onChange={(e) => onChange({ providerId: e.target.value, model: "", reasoningLevel: "" })} className={selectClass} aria-label="Provider">
         {options.providers.map((p) => (
           <option key={p.id} value={p.id} disabled={!p.available}>
             {p.displayName}
@@ -344,6 +351,9 @@ function SeatEditor({ seat, options, onChange, onRemove }: { seat: SeatDraft; op
       </select>
       <select value={seat.model} onChange={(e) => onChange({ model: e.target.value })} className={selectClass} aria-label="Model">
         <option value="">default model</option>
+        {seat.model && !provider?.models.some((m) => m.model === seat.model) ? (
+          <option value={seat.model}>{seat.model} (not in catalog)</option>
+        ) : null}
         {(provider?.models ?? []).map((m) => (
           <option key={m.model} value={m.model}>
             {m.displayName}
@@ -382,8 +392,8 @@ function CreateCouncilForm({ onCreated, onCancel }: { onCreated: (councilId: str
   const [title, setTitle] = useState("");
   const [projectId, setProjectId] = useState("");
   const [seats, setSeats] = useState<SeatDraft[]>([]);
-  const [chief, setChief] = useState("");
-  const [turns, setTurns] = useState(8);
+  const [chiefIndex, setChiefIndex] = useState(0);
+  const [turns, setTurns] = useState(DEFAULT_TURNS);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
@@ -393,7 +403,7 @@ function CreateCouncilForm({ onCreated, onCancel }: { onCreated: (councilId: str
         setOptions(result);
         const defaults = defaultSeats(result);
         setSeats(defaults);
-        setChief(defaults[0]?.handle ?? "");
+        setChiefIndex(Math.max(0, defaults.findIndex((s) => s.handle === DEFAULT_CHIEF)));
         setProjectId((current) => current || result.projects[0]?.id || "");
       },
       (cause: unknown) => setError(describeError(cause)),
@@ -408,13 +418,22 @@ function CreateCouncilForm({ onCreated, onCancel }: { onCreated: (councilId: str
     setPending(true);
     setError(null);
     try {
-      const { council } = await rpc.call("councils_create", {
-        title: title.trim(),
+      const input = createCouncilInputSchema.safeParse({
+        title,
         projectId,
         seats: seats.map(toSeatInput),
-        chief: chief.trim() || seats[0]?.handle.trim().toLowerCase() || "",
+        chief: seats[chiefIndex]?.handle.trim().toLowerCase() ?? "",
         defaultTurns: turns,
       });
+      if (!input.success) throw new Error(describeInputIssues(input.error));
+      for (const seat of input.data.seats) {
+        const provider = options.providers.find((p) => p.id === seat.providerId);
+        if (!provider?.available) throw new Error(`Seat @${seat.handle}: choose an available provider.`);
+        if (seat.model && provider.models.length > 0 && !provider.models.some((m) => m.model === seat.model)) {
+          throw new Error(`Seat @${seat.handle}: ${seat.model} is not available from ${provider.displayName}. Choose a model from its list.`);
+        }
+      }
+      const { council } = await rpc.call("councils_create", input.data);
       onCreated(council.id);
     } catch (cause) {
       setError(describeError(cause));
@@ -431,11 +450,9 @@ function CreateCouncilForm({ onCreated, onCancel }: { onCreated: (councilId: str
     );
   }
 
-  const handles = seats.map((s) => s.handle.trim().toLowerCase()).filter((h) => h !== "");
-
   return (
     <div className="h-full min-h-0 overflow-y-auto p-4 md:p-5">
-      <form onSubmit={submit} className="mx-auto w-full max-w-3xl space-y-4">
+      <form onSubmit={submit} noValidate className="mx-auto w-full max-w-3xl space-y-4">
         <div>
           <h2 className="text-sm font-semibold">New council</h2>
           <p className="text-xs text-muted-foreground">
@@ -444,7 +461,7 @@ function CreateCouncilForm({ onCreated, onCancel }: { onCreated: (councilId: str
         </div>
         <label className="block space-y-1 text-xs text-muted-foreground">
           Title
-          <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="DB choice" required />
+          <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="DB choice" maxLength={120} required />
         </label>
         <label className="block space-y-1 text-xs text-muted-foreground">
           Project
@@ -464,6 +481,7 @@ function CreateCouncilForm({ onCreated, onCancel }: { onCreated: (councilId: str
               type="button"
               variant="ghost"
               size="sm"
+              disabled={seats.length >= 8}
               onClick={() => {
                 const first = options.providers.find((p) => p.available) ?? options.providers[0];
                 if (!first) return;
@@ -474,9 +492,13 @@ function CreateCouncilForm({ onCreated, onCancel }: { onCreated: (councilId: str
               Add seat
             </Button>
           </div>
+          <p className="text-xs text-muted-foreground">Handles identify seats in @mentions. Use 1–24 letters, digits, or dashes, starting with a letter. The chief can be any seat, regardless of its name or provider.</p>
           <div className="space-y-2">
             {seats.map((seat, index) => (
-              <SeatEditor key={index} seat={seat} options={options} onChange={(patch) => update(index, patch)} onRemove={() => setSeats((current) => current.filter((_, i) => i !== index))} />
+              <SeatEditor key={index} seat={seat} options={options} onChange={(patch) => update(index, patch)} onRemove={seats.length > 2 ? () => {
+                setSeats((current) => current.filter((_, i) => i !== index));
+                setChiefIndex((current) => current === index ? 0 : current > index ? current - 1 : current);
+              } : undefined} />
             ))}
           </div>
         </div>
@@ -484,10 +506,10 @@ function CreateCouncilForm({ onCreated, onCancel }: { onCreated: (councilId: str
         <div className="grid gap-3 sm:grid-cols-2">
           <label className="block space-y-1 text-xs text-muted-foreground">
             Chief (writes the verdict)
-            <select value={chief} onChange={(event) => setChief(event.target.value)} className={cn(selectClass, "block h-9 w-full")}>
-              {handles.map((h) => (
-                <option key={h} value={h}>
-                  @{h}
+            <select value={chiefIndex} onChange={(event) => setChiefIndex(Number(event.target.value))} className={cn(selectClass, "block h-9 w-full")}>
+              {seats.map((seat, index) => (
+                <option key={index} value={index}>
+                  {seat.handle.trim() ? `@${seat.handle.trim().toLowerCase()}` : `Seat ${index + 1}`}
                 </option>
               ))}
             </select>
@@ -506,7 +528,7 @@ function CreateCouncilForm({ onCreated, onCancel }: { onCreated: (councilId: str
           </label>
         </div>
 
-        {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
+        {error ? <p role="alert" className="whitespace-pre-line text-sm text-destructive">{error}</p> : null}
         <div className="flex items-center gap-2">
           <Button type="submit" disabled={pending || seats.length < 2 || title.trim() === "" || projectId === ""}>
             <Icon name="MessageSquarePlus" className="size-4" />
