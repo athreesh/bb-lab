@@ -142,9 +142,20 @@ function formatCost(value: number | null): string | null {
 // Presentational pieces
 // ---------------------------------------------------------------------------
 
-function Metric({ label, value, tone }: { label: string; value: string; tone?: string }) {
+function Metric({
+  label,
+  value,
+  tone,
+  title,
+}: {
+  label: string;
+  value: string;
+  tone?: string;
+  /** Tooltip override; defaults to the label. */
+  title?: string;
+}) {
   return (
-    <span className="inline-flex items-baseline gap-1 tabular-nums" title={label}>
+    <span className="inline-flex items-baseline gap-1 tabular-nums" title={title ?? label}>
       <span className="text-muted-foreground">{label}</span>
       <span className={cn("font-medium", tone)}>{value}</span>
     </span>
@@ -164,6 +175,7 @@ function UsageHud() {
   const last =
     native?.last ?? omp?.lastUsage ?? null;
   const perf = omp?.perf ?? null;
+  const codexPerf = usage?.codexPerf ?? null;
   // Cost display: omp/local models are the user's own endpoints — FREE. The
   // native cost field (omp's own estimate) wins when present; otherwise a
   // catalog-priced estimate for metered providers; "~" marks estimates.
@@ -207,7 +219,18 @@ function UsageHud() {
           </>
         ) : null}
         {perf?.decodeTokensPerSec !== null && perf?.decodeTokensPerSec !== undefined ? (
-          <Metric label="tok/s" value={formatTokens(Math.round(perf.decodeTokensPerSec))} />
+          <Metric
+            label="tok/s"
+            value={formatTokens(Math.round(perf.decodeTokensPerSec))}
+            title="omp model_perf rolling decode throughput"
+          />
+        ) : null}
+        {perf?.decodeTokensPerSec == null && codexPerf?.decodeTokensPerSec != null ? (
+          <Metric
+            label="tok/s"
+            value={formatTokens(Math.round(codexPerf.decodeTokensPerSec))}
+            title={`Measured over this thread's last ${codexPerf.samples} codex responses`}
+          />
         ) : null}
         {perf?.ttftMs !== null && perf?.ttftMs !== undefined ? (
           <Metric

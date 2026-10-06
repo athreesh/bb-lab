@@ -47,6 +47,18 @@ const ompMetricsSchema = z.object({
 });
 export type OmpMetrics = z.infer<typeof ompMetricsSchema>;
 
+// Per-turn generation-throughput aggregates for closed providers, measured
+// from their local stores. Codex: rollout JSONL `token_usage_record` rows
+// (per-response output tokens) joined to ~/.codex/logs_2.sqlite
+// `Output item` → `output_item_done` log windows (per-response generation
+// time). Claude-code JSONL rows record only final usage — no duration — so
+// there is nothing to measure yet; the block stays null there.
+const codexPerfSchema = z.object({
+  samples: z.number(),
+  decodeTokensPerSec: z.number().nullable(),
+});
+export type CodexPerf = z.infer<typeof codexPerfSchema>;
+
 const threadUsageSchema = z.object({
   // Native cumulative token usage (codex/claude-code/pi). Null when the
   // provider never emitted a tokenUsage event.
@@ -78,6 +90,9 @@ const threadUsageSchema = z.object({
       pricingSource: z.literal("omp-catalog"),
     })
     .nullable(),
+  // Per-provider throughput aggregates measured from the provider's local
+  // store (codex only today; null elsewhere).
+  codexPerf: codexPerfSchema.nullable(),
 });
 export type ThreadUsage = z.infer<typeof threadUsageSchema>;
 
@@ -312,6 +327,169 @@ async function readOmpMetrics(providerThreadId: string): Promise<OmpMetrics> {
   };
 }
 
+
+// ---------------------------------------------------------------------------
+// codex per-response throughput (closed-provider tok/s)
+// ---------------------------------------------------------------------------
+
+const CODEX_DIR = join(homedir(), ".codex");
+
+interface CodexUsageRecord {
+  timestamp?: string;
+  payload?: { usage?: { output_tokens?: number } };
+}
+
+/**
+ * Generation-time windows for one codex thread from codex's own debug log
+ * (~/.codex/logs_2.sqlite). One sampling request emits, per streamed item,
+ * an "Output item item_type=..." line when its first chunk arrives and an
+ * `from="output_item_done"` line when it completes; the first→done span of
+ * message/reasoning items is that response's generation window. Rows are
+ * pruned after ~30 days, so recent threads always measure.
+ */
+function readCodexItemWindows(logsDb: string, threadId: string): Array<{ start: number; end: number | null }> {
+  try {
+    const db = new Database(logsDb, { readonly: true, fileMustExist: true });
+    try {
+      const itemType =
+        "(feedback_log_body LIKE '%item_type=\"message\"%' OR feedback_log_body LIKE '%item_type=\"reasoning\"%')";
+      const seen = db
+        .prepare(
+          `SELECT substr(feedback_log_body, instr(feedback_log_body,'item_id="') + 9, 64), ts + ts_nanos/1e9
+           FROM logs
+           WHERE thread_id = ? AND feedback_log_body LIKE '%Output item item_type=%'
+             AND feedback_log_body NOT LIKE '%from="output_item_done"%' AND ${itemType}
+           ORDER BY ts, ts_nanos`,
+        )
+        .raw(true)
+        .all(threadId) as Array<[string, number]>;
+      const done = db
+        .prepare(
+          `SELECT substr(feedback_log_body, instr(feedback_log_body,'item_id="') + 9, 64), ts + ts_nanos/1e9
+           FROM logs
+           WHERE thread_id = ? AND feedback_log_body LIKE '%from="output_item_done"%' AND ${itemType}
+           ORDER BY ts, ts_nanos`,
+        )
+        .raw(true)
+        .all(threadId) as Array<[string, number]>;
+      const firstDone: Record<string, number> = {};
+      for (const [itemId, time] of done) {
+        const known = firstDone[itemId];
+        if (known === undefined || time < known) firstDone[itemId] = time;
+      }
+      return seen
+        .map(([itemId, start]) => ({ start, end: firstDone[itemId] ?? null }))
+        .sort((a, b) => a.start - b.start);
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Tail-read per-response output token counts from the thread's codex rollout
+ * JSONL (`token_usage_record` rows). Sessions live under
+ * ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>_<threadId>.jsonl.
+ */
+async function findCodexRolloutFile(threadId: string): Promise<string | null> {
+  if (!/^[0-9a-f-]{36}$/i.test(threadId)) return null;
+  const yearDir = join(CODEX_DIR, "sessions");
+  const years = await readdirOrNull(yearDir);
+  if (years === null) return null;
+  for (const year of [...years].sort().reverse()) {
+    if (!/^\d{4}$/.test(year)) continue;
+    const months = await readdirOrNull(join(yearDir, year));
+    if (months === null) continue;
+    for (const month of [...months].sort().reverse()) {
+      if (!/^\d{2}$/.test(month)) continue;
+      const days = await readdirOrNull(join(yearDir, year, month));
+      if (days === null) continue;
+      for (const day of [...days].sort().reverse()) {
+        if (!/^\d{2}$/.test(day)) continue;
+        const entries = await readdirOrNull(join(yearDir, year, month, day));
+        if (entries === null) continue;
+        for (const entry of entries) {
+          if (entry.endsWith(".jsonl") && entry.includes(threadId)) {
+            return join(yearDir, year, month, day, entry);
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+const CODEX_ROLLOUT_TAIL_BYTES = 2 * 1024 * 1024;
+const CODEX_WINDOW_MAX_AGE_S = 300;
+const CODEX_MIN_WINDOW_S = 0.25;
+
+/**
+ * Rolling decode throughput for a codex thread: assign each rollout
+ * `token_usage_record` (response completion + output tokens) to the latest
+ * item window that opened before it, and divide summed tokens by summed
+ * generation time. Unpaired rows (log pruned, torn line) are skipped.
+ */
+async function readCodexPerf(threadId: string): Promise<CodexPerf | null> {
+  const rolloutFile = await findCodexRolloutFile(threadId);
+  if (rolloutFile === null) return null;
+  const windows = readCodexItemWindows(join(CODEX_DIR, "logs_2.sqlite"), threadId);
+  if (windows.length === 0) return null;
+  const windowStarts = windows.map((window) => window.start);
+
+  let handle: FileHandle;
+  try {
+    handle = await open(rolloutFile, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const { size } = await handle.stat();
+    const tailLength = Math.min(size, CODEX_ROLLOUT_TAIL_BYTES);
+    const buffer = Buffer.alloc(tailLength);
+    await handle.read(buffer, 0, tailLength, size - tailLength);
+    const lines = buffer.toString("utf8").split("\n");
+    let totalTokens = 0;
+    let totalSeconds = 0;
+    let samples = 0;
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i]?.trim();
+      if (line === undefined || line === "" || !line.includes('"token_usage_record"')) continue;
+      try {
+        const record = JSON.parse(line) as CodexUsageRecord;
+        const outputTokens = record.payload?.usage?.output_tokens;
+        if (record.timestamp === undefined || outputTokens === undefined) continue;
+        const parsedMs = Date.parse(record.timestamp);
+        const completedAt = Number.isNaN(parsedMs) ? NaN : parsedMs / 1000;
+        if (Number.isNaN(completedAt)) continue;
+        // Desc scan: bisect for the newest window opened before this response.
+        let low = 0;
+        let high = windowStarts.length;
+        while (low < high) {
+          const mid = (low + high) >> 1;
+          if (windowStarts[mid] <= completedAt) low = mid + 1;
+          else high = mid;
+        }
+        const index = low - 1;
+        if (index < 0) continue;
+        const window = windows[index];
+        if (completedAt - window.start > CODEX_WINDOW_MAX_AGE_S) continue;
+        const duration = Math.max((window.end ?? completedAt) - window.start, CODEX_MIN_WINDOW_S);
+        totalTokens += outputTokens;
+        totalSeconds += duration;
+        samples += 1;
+      } catch {
+        // Torn tail line from an in-flight write; keep scanning backwards.
+      }
+    }
+    if (samples === 0 || totalSeconds <= 0) return null;
+    return { samples, decodeTokensPerSec: totalTokens / totalSeconds };
+  } finally {
+    await handle.close();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // plugin factory
 // ---------------------------------------------------------------------------
@@ -404,9 +582,19 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const omp = await readOmpMetricsWhenAcp(threadId, resolvedProviderThreadId);
 
+      // Throughput for closed providers: measured from codex's local stores
+      // on codex threads only (claude-code records no generation durations).
+      let codexPerf: CodexPerf | null = null;
+      try {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.providerId === "codex") codexPerf = await readCodexPerf(resolvedProviderThreadId);
+      } catch (cause) {
+        bb.log.warn(`usage-hud: codex perf for ${threadId} failed: ${errorMessage(cause)}`);
+      }
+
       const costEstimate = await estimateCostForThread(threadId, executionModel, tokenUsage);
 
-      return { tokenUsage, contextWindow, omp, costEstimate };
+      return { tokenUsage, contextWindow, omp, costEstimate, codexPerf };
     },
   });
 
@@ -455,7 +643,14 @@ export default async function plugin(bb: BbPluginApi) {
           return { exitCode: 1, stderr: "No provider session recorded for this thread yet." };
         }
         const omp = await readOmpMetricsWhenAcp(threadId, providerThreadId);
-        const payload = { providerThreadId, native: tokenUsage, contextWindow, omp };
+        let codexPerf: CodexPerf | null = null;
+        try {
+          const thread = await bb.sdk.threads.get({ threadId });
+          if (thread.providerId === "codex") codexPerf = await readCodexPerf(providerThreadId);
+        } catch {
+          // CLI prints the rest of the payload; perf is enrichment only.
+        }
+        const payload = { providerThreadId, native: tokenUsage, contextWindow, omp, codexPerf };
         return {
           exitCode: 0,
           stdout: json ? JSON.stringify(payload) : JSON.stringify(payload, null, 2),

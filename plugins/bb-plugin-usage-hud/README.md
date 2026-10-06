@@ -11,7 +11,13 @@ HUD in the bottom-left of the bb window.
   claude-code, and pi this comes from native `thread/tokenUsage/updated`
   events. On omp threads it comes from omp's own session store.
 - **tok/s + TTFT** — omp per-model rolling aggregates (decode throughput,
-  time-to-first-token) from `~/.omp/agent/agent.db` `model_perf`.
+  time-to-first-token) from `~/.omp/agent/agent.db` `model_perf`. On codex
+  threads, tok/s is measured instead: per-response output tokens from the
+  rollout JSONL (`token_usage_record`) divided by generation windows from
+  codex's own `~/.codex/logs_2.sqlite` debug log (`Output item` →
+  `output_item_done` spans of message/reasoning items), over the thread's
+  recent responses. Claude-code records no generation durations, so its HUD
+  shows no tok/s yet.
 - **cost** — omp's per-response cost estimate (null when the provider reports
   zero cost).
 
@@ -36,12 +42,13 @@ bb usage-hud show <thread-id> [--json]
 ```
 
 Prints the same payload the HUD renders: native token usage, context window,
-and the omp enrichment block.
+and the omp / codex enrichment blocks.
 
 ## Files
 
 - `server.ts` — RPC (`usage_for_thread`) + `bb usage-hud` CLI. Reads bb
-  thread events via `bb.sdk`; reads omp session store read-only.
+  thread events via `bb.sdk`; reads omp's session store and codex's rollout +
+  debug-log stores read-only.
 - `app.tsx` — `experimental_appOverlay` component fixed to the bottom-left;
   follows the active split pane's thread; refreshes on
   `thread:changed` realtime events (debounced) plus a 15 s backstop poll.
